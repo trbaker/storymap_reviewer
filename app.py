@@ -1,27 +1,21 @@
 """
 StoryMap Review — server
 =========================
-One Flask app that:
-  • serves the annotation web page (index.html), and
-  • captures a storymap with a headless browser and reports live progress.
+Flask app that serves the annotator page and captures a storymap with a
+headless browser, reporting live progress to an in-app log.
 
-Capture is a *job*: POST /api/capture starts it on a background thread and
-returns a job id; the page polls GET /api/capture/status/<id> for a growing
-log, then GET /api/capture/result/<id> for the finished PNG. This lets the
-page show an on-screen log of every step.
-
-Why capture is non-trivial: ArcGIS StoryMaps does not scroll the document.
-The story lives inside an inner scrolling container while the page body stays
-one screen tall, so a naive full_page screenshot only grabs the cover. We find
-the real scroll container, scroll it in steps so lazy media loads, screenshot
-each step, and stitch the strips into one long image.
+Capture strategy (v3): ArcGIS StoryMaps does not scroll the document the way a
+normal page does, and the scroll container is not reliably found by inspecting
+CSS overflow. So instead of guessing, we DISCOVER the real scroller: send a real
+mouse wheel event and watch which element's scroll position actually moved. We
+then scroll that element precisely, screenshot each step clipped to its content
+area, and stitch the strips into one tall image. Detailed diagnostics are logged
+so a failed capture is debuggable from the in-app log.
 
 Run locally:
     pip install -r requirements.txt
     playwright install chromium          # only if NOT using the Playwright Docker image
     python app.py
-
-Deploy: see README.md (Docker -> Render).
 """
 
 import io
@@ -40,48 +34,76 @@ from PIL import Image
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 
-# --- Safety: only allow capturing ArcGIS StoryMaps hosts (prevents SSRF). ---
 ALLOWED_HOST_SUFFIXES = ("arcgis.com",)
-
 ITEM_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
 VIEWPORT = {"width": 1366, "height": 1200}
 
-# --- Job store -------------------------------------------------------------
 JOBS = {}
 JOBS_LOCK = threading.Lock()
-CAPTURE_LOCK = threading.Lock()       # one capture at a time (memory safety)
+CAPTURE_LOCK = threading.Lock()
 RUNNING = {"jid": None}
-JOB_TTL = 900                          # seconds to keep a finished job around
+JOB_TTL = 900
 
-FIND_SCROLLER_JS = r"""
+# Gather scroll-candidate elements (document + any overflow element) and stash
+# them on window.__cands; also return diagnostics about the page.
+DISCOVER_JS = r"""
 () => {
-  const sh = el => el.scrollHeight - el.clientHeight;
-  let best = document.scrollingElement || document.documentElement;
-  let bestScore = sh(best);
+  const cands = [document.scrollingElement || document.documentElement];
   for (const el of document.querySelectorAll('*')) {
     const cs = getComputedStyle(el);
-    if (/(auto|scroll|overlay)/.test(cs.overflowY) && sh(el) > 120 && sh(el) > bestScore) {
-      best = el; bestScore = sh(el);
+    if (/(auto|scroll|overlay)/.test(cs.overflowY) && el.scrollHeight - el.clientHeight > 40) {
+      cands.push(el);
     }
   }
-  window.__sc = best;
-  const isDoc = best === document.scrollingElement || best === document.documentElement || best === document.body;
-  const r = best.getBoundingClientRect();
-  const vw = window.innerWidth, vh = window.innerHeight;
-  const left   = isDoc ? 0  : Math.max(0, r.left);
-  const top    = isDoc ? 0  : Math.max(0, r.top);
-  const width  = isDoc ? vw : Math.min(r.width,  vw - left);
-  const height = isDoc ? vh : Math.min(r.height, vh - top);
-  return { isDoc, left, top, width, height,
-           clientHeight: best.clientHeight, scrollHeight: best.scrollHeight };
+  window.__cands = cands;
+  const label = el => {
+    if (el === (document.scrollingElement || document.documentElement)) return 'document';
+    let s = el.tagName.toLowerCase();
+    if (el.id) s += '#' + el.id;
+    if (typeof el.className === 'string' && el.className.trim())
+      s += '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.');
+    return s;
+  };
+  const cdiag = cands.slice(0, 8).map((el, i) => ({ i, label: label(el).slice(0, 60),
+                  sh: Math.round(el.scrollHeight), ch: Math.round(el.clientHeight) }));
+  const ifr = [...document.querySelectorAll('iframe')].slice(0, 5).map(f => {
+    const r = f.getBoundingClientRect();
+    return { w: Math.round(r.width), h: Math.round(r.height), src: (f.src || '').slice(0, 50) };
+  });
+  return {
+    winY: window.scrollY, innerH: window.innerHeight,
+    docH: document.documentElement.scrollHeight, bodyH: document.body.scrollHeight,
+    frames: window.frames.length, iframes: ifr, cands: cdiag
+  };
 }
 """
 
-SET_SCROLL_JS = r"""
+READ_TOPS_JS = r"""
+() => ({
+  tops: window.__cands.map(el => el.scrollTop),
+  winY: window.scrollY,
+  docH: document.documentElement.scrollHeight,
+  innerH: window.innerHeight
+})
+"""
+
+SET_ACTIVE_JS = r"""
+(idx) => {
+  const el = idx >= 0 ? window.__cands[idx] : null;
+  window.__active = el;
+  if (el) { const r = el.getBoundingClientRect();
+            return { left: r.left, top: r.top, width: r.width, height: r.height }; }
+  return { left: 0, top: 0, width: 0, height: 0 };
+}
+"""
+
+SCROLL_ACTIVE_JS = r"""
 (y) => {
-  const el = window.__sc;
-  el.scrollTop = y;
-  return { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+  const el = window.__active;
+  if (el) { el.scrollTop = y;
+            return { offset: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight }; }
+  window.scrollTo(0, y);
+  return { offset: window.scrollY, scrollHeight: document.documentElement.scrollHeight, clientHeight: window.innerHeight };
 }
 """
 
@@ -111,16 +133,12 @@ def _job_log(job, msg, level="srv"):
     print("[capture]", msg, file=sys.stderr, flush=True)
 
 
-# --- Capture ----------------------------------------------------------------
 def capture_storymap(url, scale, progress):
-    """progress(msg, level) is called as work proceeds.
-    Returns (png_bytes, meta_dict)."""
     scale = 2 if int(scale) == 2 else 1
+    vw, vh = VIEWPORT["width"], VIEWPORT["height"]
     progress("Launching headless browser…", "info")
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-        )
+        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
         context = browser.new_context(viewport=VIEWPORT, device_scale_factor=scale)
         page = context.new_page()
         progress(f"Loading page (scale {scale}x)…", "info")
@@ -128,78 +146,94 @@ def capture_storymap(url, scale, progress):
             page.goto(url, wait_until="load", timeout=90000)
         except PWTimeout:
             progress("Load event timed out — continuing with what rendered.", "info")
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(4500)
 
-        info = page.evaluate(FIND_SCROLLER_JS)
+        # --- Diagnostics ---
+        d = page.evaluate(DISCOVER_JS)
+        progress(f"Page: window doc {d['docH']}px, body {d['bodyH']}px, "
+                 f"iframes {d['frames']}, scroll-candidates {len(d['cands'])}.", "info")
+        for c in d["cands"]:
+            progress(f"  cand[{c['i']}] {c['label']} — sh {c['sh']} / ch {c['ch']}")
+        for f in d["iframes"]:
+            if f["w"] > 300 and f["h"] > 300:
+                progress(f"  iframe {f['w']}×{f['h']} src={f['src']}")
 
-        if info["isDoc"] and info["scrollHeight"] > info["clientHeight"] + 50:
-            progress("Document scrolls normally — capturing full page.", "info")
-            _settle_scroll(page)
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(1000)
-            png = page.screenshot(full_page=True, type="png")
-            w, h = Image.open(io.BytesIO(png)).size
-            meta = {"mode": "fullpage", "strips": 1, "width": w, "height": h}
-            context.close(); browser.close()
-            return png, meta
+        # --- Discover which element actually scrolls on a real wheel ---
+        page.mouse.move(vw / 2, vh / 2)
+        before = page.evaluate(READ_TOPS_JS)
+        page.mouse.wheel(0, int(vh * 0.85))
+        page.wait_for_timeout(900)
+        after = page.evaluate(READ_TOPS_JS)
 
-        progress(f"Found inner scroll container · content ≈{int(info['scrollHeight'])}px tall.", "info")
-        clip = {"x": int(info["left"]), "y": int(info["top"]),
-                "width": int(info["width"]), "height": int(info["height"])}
+        win_d = after["winY"] - before["winY"]
+        best_i, best_d = -1, 0
+        for idx in range(len(after["tops"])):
+            delta = after["tops"][idx] - before["tops"][idx]
+            if delta > best_d:
+                best_d, best_i = delta, idx
+        progress(f"Wheel test: window moved {int(win_d)}px, "
+                 f"best element cand[{best_i}] moved {int(best_d)}px.", "info")
+
+        if best_i > 0 and best_d >= win_d and best_d > 2:
+            active_idx = best_i           # a genuine inner scroller
+            progress(f"Active scroller: cand[{best_i}].", "info")
+        elif win_d > 2 or best_i == 0:
+            active_idx = -1               # document / window scroll
+            progress("Active scroller: window/document.", "info")
+        else:
+            active_idx = -1
+            progress("Nothing scrolled on a wheel event — falling back to window. "
+                     "If the result is one section, the story likely uses a custom "
+                     "scroll engine; send me these diagnostic lines.", "info")
+
+        rect = page.evaluate(SET_ACTIVE_JS, active_idx)
+        if active_idx == -1:
+            clip = {"x": 0, "y": 0, "width": vw, "height": vh}
+        else:
+            left = max(0, int(rect["left"])); top = max(0, int(rect["top"]))
+            width = min(vw - left, int(rect["width"])); height = min(vh - top, int(rect["height"]))
+            clip = {"x": left, "y": top, "width": width, "height": height} \
+                if width > 0 and height > 0 else {"x": 0, "y": 0, "width": vw, "height": vh}
+
+        # --- Back to top, then capture & stitch ---
+        page.evaluate(SCROLL_ACTIVE_JS, 0)
+        page.wait_for_timeout(900)
         step = max(200, clip["height"])
         strips = []
-        y = 0
-        last_top = -1
-        stall = 0
-        final_sh = info["scrollHeight"]
+        last_off, stall, final_sh, y = -1, 0, 0, 0
 
         for _ in range(500):
-            m = page.evaluate(SET_SCROLL_JS, y)
+            m = page.evaluate(SCROLL_ACTIVE_JS, y)
             page.wait_for_timeout(850)
             try:
                 page.wait_for_load_state("networkidle", timeout=2500)
             except PWTimeout:
                 pass
-            strips.append((m["scrollTop"], page.screenshot(type="png", clip=clip)))
+            strips.append((m["offset"], page.screenshot(type="png", clip=clip)))
             final_sh = m["scrollHeight"]
-            pct = min(100, int(100 * (m["scrollTop"] + m["clientHeight"]) / max(1, m["scrollHeight"])))
-            progress(f"Captured section {len(strips)} · {int(m['scrollTop'])}px / {int(m['scrollHeight'])}px ({pct}%)")
+            pct = min(100, int(100 * (m["offset"] + m["clientHeight"]) / max(1, m["scrollHeight"])))
+            progress(f"Captured section {len(strips)} · {int(m['offset'])}px / "
+                     f"{int(m['scrollHeight'])}px ({pct}%)")
 
-            if m["scrollTop"] + m["clientHeight"] >= m["scrollHeight"] - 2:
+            if m["offset"] + m["clientHeight"] >= m["scrollHeight"] - 2:
                 break
-            if m["scrollTop"] == last_top:
+            if m["offset"] == last_off:
                 stall += 1
                 if stall >= 2:
                     progress("Scrolling stalled — stopping.", "info")
                     break
             else:
                 stall = 0
-            last_top = m["scrollTop"]
-            y = m["scrollTop"] + step
+            last_off = m["offset"]
+            y = m["offset"] + step
 
-        progress(f"Stitching {len(strips)} sections…", "info")
+        progress(f"Stitching {len(strips)} section(s)…", "info")
         png, (w, h) = _stitch(strips, final_sh, scale)
         progress(f"Encoded image {w}×{h}px.", "info")
-        meta = {"mode": "strips", "strips": len(strips), "width": w, "height": h}
+        meta = {"mode": "strips" if len(strips) > 1 else "single",
+                "strips": len(strips), "width": w, "height": h}
         context.close(); browser.close()
         return png, meta
-
-
-def _settle_scroll(page):
-    page.evaluate(
-        """async () => {
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            let locked = -1;
-            for (let i = 0; i < 600; i++) {
-                window.scrollBy(0, Math.floor(window.innerHeight * 0.85));
-                await sleep(400);
-                const h = document.body.scrollHeight;
-                const atBottom = window.scrollY + window.innerHeight >= h - 4;
-                if (atBottom && h === locked) break;
-                locked = atBottom ? h : locked;
-            }
-        }"""
-    )
 
 
 def _stitch(strips, final_scroll_height_css, scale):
@@ -236,18 +270,13 @@ def _run_job(jid, url, scale):
         with CAPTURE_LOCK:
             png, meta = capture_storymap(url, scale, lambda m, level="srv": _job_log(job, m, level))
         if not png:
-            job["status"] = "error"
-            job["error"] = "No image produced (no scrollable content found)."
+            job["status"] = "error"; job["error"] = "No image produced."
             _job_log(job, "Error: no image produced.", "error")
         else:
-            job["image"] = png
-            job["meta"] = meta
-            job["status"] = "done"
-            _job_log(job, f"Done · {meta['mode']} · {meta['strips']} section(s) · "
-                          f"{meta['width']}×{meta['height']}px.", "success")
+            job["image"] = png; job["meta"] = meta; job["status"] = "done"
+            _job_log(job, f"Done · {meta['strips']} section(s) · {meta['width']}×{meta['height']}px.", "success")
     except Exception as e:  # noqa: BLE001
-        job["status"] = "error"
-        job["error"] = str(e)
+        job["status"] = "error"; job["error"] = str(e)
         _job_log(job, f"Error: {e}", "error")
     finally:
         with JOBS_LOCK:
@@ -271,20 +300,18 @@ def api_capture_start():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
     scale = data.get("scale", 1)
-
     if not url:
         return jsonify(error="No URL provided."), 400
     if not url.lower().startswith(("http://", "https://")):
         return jsonify(error="URL must start with http:// or https://"), 400
     if not host_allowed(url):
-        allowed = ", ".join(ALLOWED_HOST_SUFFIXES)
-        return jsonify(error=f"Only these hosts are allowed: {allowed}. "
-                             f"Edit ALLOWED_HOST_SUFFIXES in app.py to add more."), 400
+        return jsonify(error="Only *.arcgis.com URLs are allowed. "
+                             "Edit ALLOWED_HOST_SUFFIXES in app.py to add more."), 400
 
     _sweep_jobs()
     with JOBS_LOCK:
         if RUNNING["jid"] and JOBS.get(RUNNING["jid"], {}).get("status") == "running":
-            return jsonify(error="A capture is already running. Please wait for it to finish."), 429
+            return jsonify(error="A capture is already running. Please wait."), 429
         jid = uuid.uuid4().hex
         item_id = extract_item_id(url) or "storymap"
         JOBS[jid] = {"status": "running", "log": [], "image": None, "meta": {},
@@ -317,7 +344,7 @@ def api_capture_result(jid):
     resp.headers["Content-Type"] = "image/png"
     resp.headers["X-Item-Id"] = job["item_id"]
     resp.headers["Cache-Control"] = "no-store"
-    JOBS.pop(jid, None)        # free the image now that it's delivered
+    JOBS.pop(jid, None)
     return resp
 
 
