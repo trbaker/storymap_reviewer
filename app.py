@@ -136,6 +136,16 @@ def extract_item_id(url: str):
     return m.group(1) if m else None
 
 
+def to_print_url(url: str) -> str:
+    """Normalize a story URL to its print view, which renders the whole story as
+    a static, fully-laid-out document with maps as flat snapshots — far easier
+    to screenshot than the live scrollytelling view."""
+    base = url.split("?")[0].split("#")[0].rstrip("/")
+    if base.endswith("/print"):
+        return base
+    return base + "/print"
+
+
 def host_allowed(url: str) -> bool:
     try:
         netloc = urlparse(url).netloc.lower().split(":")[0]
@@ -193,9 +203,10 @@ def capture_storymap(url, scale, progress):
         context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = context.new_page()
 
-        progress(f"Loading page (scale {scale}x)…", "info")
+        capture_url = to_print_url(url)
+        progress(f"Loading print view (scale {scale}x): {capture_url}", "info")
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            page.goto(capture_url, wait_until="domcontentloaded", timeout=90000)
         except PWTimeout:
             progress("Initial load timed out — continuing.", "info")
         try:
@@ -203,7 +214,18 @@ def capture_storymap(url, scale, progress):
         except PWTimeout:
             pass
 
-        _wait_for_story(page, progress, vw, vh)
+        ready = _wait_for_story(page, progress, vw, vh)
+        if not ready and capture_url != url:
+            progress("Print view didn't expand — falling back to the standard story view.", "info")
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            except PWTimeout:
+                pass
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
+            except PWTimeout:
+                pass
+            _wait_for_story(page, progress, vw, vh)
         page.wait_for_timeout(1500)
 
         # --- Diagnostics ---
