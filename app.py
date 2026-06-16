@@ -4,13 +4,17 @@ StoryMap Review — server
 Flask app that serves the annotator page and captures a storymap with a
 headless browser, reporting live progress to an in-app log.
 
-Capture strategy (v3): ArcGIS StoryMaps does not scroll the document the way a
-normal page does, and the scroll container is not reliably found by inspecting
-CSS overflow. So instead of guessing, we DISCOVER the real scroller: send a real
-mouse wheel event and watch which element's scroll position actually moved. We
-then scroll that element precisely, screenshot each step clipped to its content
-area, and stitch the strips into one tall image. Detailed diagnostics are logged
-so a failed capture is debuggable from the in-app log.
+Capture strategy (v4):
+  1. Load the page, look less like an automated browser, then WAIT for the
+     story to actually build — ArcGIS StoryMaps is a client-side app that
+     fetches the story and renders sections after load, so the document starts
+     at one screen tall and grows. We poll the document height (nudging with a
+     wheel / End key) until it expands past one screen.
+  2. DISCOVER the real scroll target by sending a real wheel event and seeing
+     what moves (window or an inner element).
+  3. Scroll that target precisely, screenshot each step clipped to its content
+     area, and stitch the strips into one tall image.
+Detailed diagnostics are logged so a failed capture is debuggable from the log.
 
 Run locally:
     pip install -r requirements.txt
@@ -37,6 +41,8 @@ app = Flask(__name__)
 ALLOWED_HOST_SUFFIXES = ("arcgis.com",)
 ITEM_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
 VIEWPORT = {"width": 1366, "height": 1200}
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -44,8 +50,9 @@ CAPTURE_LOCK = threading.Lock()
 RUNNING = {"jid": None}
 JOB_TTL = 900
 
-# Gather scroll-candidate elements (document + any overflow element) and stash
-# them on window.__cands; also return diagnostics about the page.
+READY_JS = ("() => ({ docH: document.documentElement.scrollHeight, "
+            "bodyH: document.body.scrollHeight, innerH: window.innerHeight })")
+
 DISCOVER_JS = r"""
 () => {
   const cands = [document.scrollingElement || document.documentElement];
@@ -133,20 +140,54 @@ def _job_log(job, msg, level="srv"):
     print("[capture]", msg, file=sys.stderr, flush=True)
 
 
+def _wait_for_story(page, progress, vw, vh):
+    """Poll until the document grows past one screen, nudging it to load."""
+    progress("Waiting for the story to build its sections…", "info")
+    s = {"docH": vh, "innerH": vh}
+    for i in range(30):                       # up to ~45s
+        s = page.evaluate(READY_JS)
+        if i % 3 == 0:
+            progress(f"  loading… document {int(s['docH'])}px tall")
+        if s["docH"] > s["innerH"] * 1.5:
+            progress(f"Story expanded to {int(s['docH'])}px — proceeding.", "info")
+            return True
+        page.mouse.move(vw / 2, vh / 2)
+        page.mouse.wheel(0, int(vh))
+        try:
+            page.keyboard.press("End")
+        except Exception:
+            pass
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(1500)
+    progress(f"Story stayed at {int(s['docH'])}px after waiting (one screen). "
+             f"Capturing what rendered — this story may block headless rendering.", "info")
+    return False
+
+
 def capture_storymap(url, scale, progress):
     scale = 2 if int(scale) == 2 else 1
     vw, vh = VIEWPORT["width"], VIEWPORT["height"]
     progress("Launching headless browser…", "info")
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-        context = browser.new_context(viewport=VIEWPORT, device_scale_factor=scale)
+        context = browser.new_context(viewport=VIEWPORT, device_scale_factor=scale,
+                                      user_agent=UA, locale="en-US")
+        # look less like an automated browser (some apps degrade for bots)
+        context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = context.new_page()
+
         progress(f"Loading page (scale {scale}x)…", "info")
         try:
-            page.goto(url, wait_until="load", timeout=90000)
+            page.goto(url, wait_until="domcontentloaded", timeout=90000)
         except PWTimeout:
-            progress("Load event timed out — continuing with what rendered.", "info")
-        page.wait_for_timeout(4500)
+            progress("Initial load timed out — continuing.", "info")
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except PWTimeout:
+            pass
+
+        _wait_for_story(page, progress, vw, vh)
+        page.wait_for_timeout(1500)
 
         # --- Diagnostics ---
         d = page.evaluate(DISCOVER_JS)
@@ -175,16 +216,15 @@ def capture_storymap(url, scale, progress):
                  f"best element cand[{best_i}] moved {int(best_d)}px.", "info")
 
         if best_i > 0 and best_d >= win_d and best_d > 2:
-            active_idx = best_i           # a genuine inner scroller
+            active_idx = best_i
             progress(f"Active scroller: cand[{best_i}].", "info")
-        elif win_d > 2 or best_i == 0:
-            active_idx = -1               # document / window scroll
+        elif win_d > 2 or best_i == 0 or d["docH"] > vh + 50:
+            active_idx = -1
             progress("Active scroller: window/document.", "info")
         else:
             active_idx = -1
             progress("Nothing scrolled on a wheel event — falling back to window. "
-                     "If the result is one section, the story likely uses a custom "
-                     "scroll engine; send me these diagnostic lines.", "info")
+                     "If the result is one section, send me these diagnostic lines.", "info")
 
         rect = page.evaluate(SET_ACTIVE_JS, active_idx)
         if active_idx == -1:
