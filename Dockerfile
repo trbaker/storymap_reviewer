@@ -9,13 +9,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Render injects PORT (default 10000) and expects the app on 0.0.0.0.
-ENV PORT=10000
-EXPOSE 10000
+# Port works on both hosts:
+#   • Hugging Face Spaces (free: 2 vCPU / 16 GB RAM): PORT is unset, so we bind
+#     7860, which is declared as app_port in README.md.
+#   • Render: injects PORT (e.g. 10000) at runtime, overriding the default.
+EXPOSE 7860
 
-# Shell form so ${PORT} expands. One worker keeps memory low (each capture
-# launches a Chromium ~300-500MB); raise --workers on a larger instance.
-# --timeout 300 because a long-story capture can take ~a minute.
-# 1 worker keeps memory low (one Chromium at a time). Threads let status polls
-# and the result download be served while the capture runs on a background thread.
-CMD gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 4 --timeout 300 app:app
+# 1 worker keeps one Chromium at a time; threads serve status polls and the
+# result download while the capture runs on a background thread.
+CMD gunicorn --bind 0.0.0.0:${PORT:-7860} --workers 1 --threads 4 --timeout 300 app:app

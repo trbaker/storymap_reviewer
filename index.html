@@ -338,12 +338,19 @@ async function captureFromServer(){
   finally{$('captureBtn').disabled=false; spin(false);}
 }
 async function pollJob(jid){
-  let idx=0, misses=0;
+  let idx=0, misses=0, gone=0;
   while(true){
-    await sleep(800);
-    let s;
-    try{const r=await fetch('/api/capture/status/'+jid);if(!r.ok)throw new Error('status '+r.status);s=await r.json();misses=0;}
-    catch(e){if(++misses>=5){throw new Error('Lost contact with the server while polling.');}continue;}
+    await sleep(900);
+    let r;
+    try{ r=await fetch('/api/capture/status/'+jid); }
+    catch(e){ if(++misses>=15){throw new Error('Lost contact with the server (network) — it may be restarting.');} continue; }
+    if(r.status===404){
+      if(++gone>=3){ throw new Error('The server dropped this job — it most likely restarted (often an out-of-memory kill on a small instance). Check Render → Logs and Metrics; bumping to a larger instance usually fixes it.'); }
+      continue;
+    }
+    if(!r.ok){ if(++misses>=15){throw new Error('Server returned errors while polling (HTTP '+r.status+').');} continue; }
+    misses=0; gone=0;
+    const s=await r.json();
     for(;idx<s.log.length;idx++){const e=s.log[idx];log(e.msg,e.level,e.t);}
     if(s.status==='done'){await fetchResult(jid);return;}
     if(s.status==='error'){throw new Error(s.error||'Capture failed on the server.');}

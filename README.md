@@ -1,3 +1,13 @@
+---
+title: StoryMap Review
+emoji: 🗺️
+colorFrom: red
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # StoryMap Review
 
 A teacher tool for grading ArcGIS StoryMaps. Paste a student's storymap URL,
@@ -37,6 +47,33 @@ marks with the image.
 
 No build/start commands to set — the Dockerfile's `CMD` runs gunicorn bound to
 `0.0.0.0:$PORT`, which is what Render expects.
+
+## Deploy to Hugging Face Spaces (free, 16 GB RAM)
+
+The free CPU tier gives 2 vCPU and 16 GB RAM with Docker support — plenty for
+headless Chromium, and no credit card. The YAML block at the top of this README
+configures the Space (`sdk: docker`, `app_port: 7860`).
+
+1. Create a Hugging Face account, then **New → Space**. Give it a name, pick
+   **Docker** as the SDK, and **Blank** as the template. Leave hardware on the
+   free **CPU basic** tier.
+2. Push these files to the Space's git repo (it works like any git remote):
+   ```bash
+   git remote add space https://huggingface.co/spaces/<your-username>/<space-name>
+   git push space main
+   ```
+   (Or use the Space's web "Files" tab to upload them.)
+3. The Space builds the Dockerfile and starts. The app is at
+   `https://<your-username>-<space-name>.hf.space`.
+
+Notes specific to Spaces:
+- **Visibility:** a public Space means anyone with the URL can run captures.
+  The `*.arcgis.com` allow-list keeps that low-risk (they could only screenshot
+  public storymaps). Set the Space to **Private** in its settings if you want it
+  to yourself.
+- The Space **sleeps** after inactivity and cold-starts on the next visit
+  (~30–60s), which is fine for occasional grading.
+- Disk is ephemeral (resets on restart) — not a problem; captures live in memory.
 
 ## Run locally
 
