@@ -114,6 +114,19 @@ SCROLL_ACTIVE_JS = r"""
 }
 """
 
+# Hide maps/videos we've already scrolled past so their WebGL canvases stop
+# repainting — otherwise cumulative render load grows and screenshots stall.
+PRUNE_JS = r"""
+() => {
+  let n = 0;
+  for (const el of document.querySelectorAll('canvas, video, iframe')) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom < -50 && el.style.visibility !== 'hidden') { el.style.visibility = 'hidden'; n++; }
+  }
+  return n;
+}
+"""
+
 
 def extract_item_id(url: str):
     m = ITEM_ID_RE.search(url or "")
@@ -248,7 +261,11 @@ def capture_storymap(url, scale, progress):
 
         for _ in range(500):
             m = page.evaluate(SCROLL_ACTIVE_JS, y)
-            page.wait_for_timeout(1100)        # let media in view paint
+            page.wait_for_timeout(1500)        # let media in view paint
+            pruned = page.evaluate(PRUNE_JS)    # drop already-passed maps/videos
+            if pruned:
+                progress(f"  freed {pruned} off-screen map/media element(s).")
+            page.wait_for_timeout(200)
             final_sh = m["scrollHeight"]
             shot = _shot(page, clip)
             if shot is None:
