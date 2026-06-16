@@ -37,7 +37,8 @@
   .capture{height:38px;border:0;border-radius:8px;padding:0 15px;cursor:pointer;background:var(--teal);color:#fff;font-weight:600;font-size:13px;
     display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
   .capture:hover{filter:brightness(1.08)}
-  .capture:disabled{opacity:.5;cursor:not-allowed}
+  .capture:disabled{opacity:.7;cursor:not-allowed}
+  .btnspin{width:13px;height:13px;border-radius:50%;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;animation:spin 1s linear infinite;display:inline-block;vertical-align:-2px;margin-right:2px}
   .mini{height:30px;border:1px solid var(--line);background:var(--ink-2);color:var(--text-dim);border-radius:6px;padding:0 11px;font-size:12px;cursor:pointer;
     white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
   .mini:hover{color:var(--text);border-color:#3a4753}
@@ -158,9 +159,6 @@
       Capture &amp; annotate
     </button>
     <label class="hires" title="Higher resolution — use only for short stories"><input type="checkbox" id="hires"> Hi-res</label>
-    <button class="mini" id="logToggle" title="Show status log">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/></svg> Log
-    </button>
     <button class="mini" id="openDrawer" title="View the live storymap for reference">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg> View live
     </button>
@@ -215,7 +213,7 @@
       <div class="empty" id="empty">
         <svg class="mapmark" width="58" height="58" viewBox="0 0 24 24" fill="none" stroke="#2a7d7b" stroke-width="1.4"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2Z"/><path d="M9 4v14M15 6v14" stroke-dasharray="2 2"/></svg>
         <h2>Paste a storymap URL, then Capture &amp; annotate</h2>
-        <p>The server renders the storymap, scrolls through it so every image and map loads, and returns one tall image to grade. Watch progress in the status log (the <strong>Log</strong> button up top).</p>
+        <p>The server renders the storymap, scrolls through it so every image and map loads, and returns one tall image to grade. A long story can take a minute or two.</p>
         <ol class="ol">
           <li>Paste the student's storymap URL above.</li>
           <li>Click <strong>Capture &amp; annotate</strong> — capture takes a minute or two for a long story.</li>
@@ -272,7 +270,7 @@ let state={tool:'pen',stamp:null,color:'#e23b2e',width:6,objects:[],history:[],h
 /* ---------- log window ---------- */
 function escapeHtml(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 let logHasContent=false;
-function openLog(show){const p=$('logPanel');p.classList.toggle('open',show);$('logToggle').classList.toggle('active',show);}
+function openLog(show){$('logPanel').classList.toggle('open',show);}
 function spin(on){$('logSpin').classList.toggle('on',on);}
 function log(msg,level,stamp){
   const body=$('logBody');
@@ -283,9 +281,7 @@ function log(msg,level,stamp){
   line.innerHTML=`<span class="logt">${t}</span>${escapeHtml(msg)}`;
   body.appendChild(line);
   body.scrollTop=body.scrollHeight;
-  openLog(true);
 }
-$('logToggle').onclick=()=>openLog(!$('logPanel').classList.contains('open'));
 $('logHide').onclick=()=>openLog(false);
 $('logClear').onclick=()=>{$('logBody').innerHTML='<div class="logempty">Log cleared.</div>';logHasContent=false;};
 
@@ -325,7 +321,8 @@ $('captureBtn').onclick=captureFromServer;
 async function captureFromServer(){
   const url=urlInput.value.trim();
   if(!url){urlInput.focus();toast('Paste a storymap URL first.',true);return;}
-  $('captureBtn').disabled=true; spin(true); openLog(true);
+  const capBtn=$('captureBtn'); const capHtml=capBtn.innerHTML;
+  capBtn.disabled=true; capBtn.innerHTML='<span class="btnspin"></span> Capturing…'; spin(true);
   log('Requesting capture: '+url,'info');
   try{
     const r=await fetch('/api/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,scale:$('hires').checked?2:1})});
@@ -335,7 +332,7 @@ async function captureFromServer(){
     log('Job started ('+job_id.slice(0,8)+'…). Rendering on the server…','info');
     await pollJob(job_id);
   }catch(err){log('✗ '+err.message,'error');toast(err.message,true);}
-  finally{$('captureBtn').disabled=false; spin(false);}
+  finally{capBtn.disabled=false; capBtn.innerHTML=capHtml; spin(false);}
 }
 async function pollJob(jid){
   let idx=0, misses=0, gone=0;
