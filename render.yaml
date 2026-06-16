@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: storymap-review
+    runtime: docker
+    plan: starter            # 512MB RAM. Bump to "standard" if captures OOM.
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
