@@ -169,7 +169,11 @@ def capture_storymap(url, scale, progress):
     vw, vh = VIEWPORT["width"], VIEWPORT["height"]
     progress("Launching headless browser…", "info")
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        browser = p.chromium.launch(args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--enable-unsafe-swiftshader",   # allow WebGL maps to render in software
+            "--hide-scrollbars", "--mute-audio",
+        ])
         context = browser.new_context(viewport=VIEWPORT, device_scale_factor=scale,
                                       user_agent=UA, locale="en-US")
         # look less like an automated browser (some apps degrade for bots)
@@ -240,20 +244,26 @@ def capture_storymap(url, scale, progress):
         page.wait_for_timeout(900)
         step = max(200, clip["height"])
         strips = []
-        last_off, stall, final_sh, y = -1, 0, 0, 0
+        last_off, stall, final_sh, y, fails = -1, 0, 0, 0, 0
 
         for _ in range(500):
             m = page.evaluate(SCROLL_ACTIVE_JS, y)
-            page.wait_for_timeout(850)
-            try:
-                page.wait_for_load_state("networkidle", timeout=2500)
-            except PWTimeout:
-                pass
-            strips.append((m["offset"], page.screenshot(type="png", clip=clip)))
+            page.wait_for_timeout(1100)        # let media in view paint
             final_sh = m["scrollHeight"]
-            pct = min(100, int(100 * (m["offset"] + m["clientHeight"]) / max(1, m["scrollHeight"])))
-            progress(f"Captured section {len(strips)} · {int(m['offset'])}px / "
-                     f"{int(m['scrollHeight'])}px ({pct}%)")
+            shot = _shot(page, clip)
+            if shot is None:
+                fails += 1
+                progress(f"Section {len(strips) + 1}: screenshot timed out — skipping.", "info")
+                if fails >= 3:
+                    progress("Screenshots keep timing out (heavy maps under software "
+                             "rendering). Stopping with what we have.", "info")
+                    break
+            else:
+                fails = 0
+                strips.append((m["offset"], shot))
+                pct = min(100, int(100 * (m["offset"] + m["clientHeight"]) / max(1, m["scrollHeight"])))
+                progress(f"Captured section {len(strips)} · {int(m['offset'])}px / "
+                         f"{int(m['scrollHeight'])}px ({pct}%)")
 
             if m["offset"] + m["clientHeight"] >= m["scrollHeight"] - 2:
                 break
@@ -274,6 +284,15 @@ def capture_storymap(url, scale, progress):
                 "strips": len(strips), "width": w, "height": h}
         context.close(); browser.close()
         return png, meta
+
+
+def _shot(page, clip):
+    """One screenshot, animations frozen, generous timeout. Returns bytes or
+    None on timeout (caller skips that strip rather than aborting)."""
+    try:
+        return page.screenshot(type="png", clip=clip, timeout=35000, animations="disabled")
+    except PWTimeout:
+        return None
 
 
 def _stitch(strips, final_scroll_height_css, scale):
