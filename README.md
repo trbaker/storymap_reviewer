@@ -46,15 +46,38 @@ playwright install chromium      # only needed outside the Docker image
 python app.py                    # http://localhost:10000
 ```
 
+## How the capture handles StoryMaps' scrolling
+
+ArcGIS StoryMaps doesn't scroll the page — the story sits in an inner scrolling
+container while the document body stays one screen tall. A plain `full_page`
+screenshot therefore only grabs the cover. So `app.py` finds the real scroll
+container (largest scrollable element), scrolls *it* in viewport-sized steps so
+each section's lazy images and maps load, screenshots each step, and stitches
+the strips into one tall PNG with Pillow. Normal pages that scroll the document
+still take the simple one-shot `full_page` path automatically.
+
+## Diagnostics
+
+Each successful capture sets response headers and logs to stderr (visible in
+Render's **Logs** tab):
+
+- `X-Capture-Mode`: `strips` (nested scroll, stitched) or `fullpage`.
+- `X-Capture-Strips`: how many strips were stitched.
+- Log lines like `[capture] scroller: {...}` and `[capture] done: {...}` show the
+  detected container geometry and final height — handy if a capture looks wrong.
+
 ## Notes & knobs
 
 - **Allowed hosts (security):** `app.py` only captures `*.arcgis.com` URLs, to
   stop the service being used to screenshot arbitrary/internal URLs (SSRF). Edit
   `ALLOWED_HOST_SUFFIXES` to add domains.
-- **Very tall stories:** browsers cap canvas height (~32k px). If a capture is
-  enormous, leave **Hi-res off** (the default) — Hi-res doubles pixel height. If
-  an export still fails, the app tells you to retry without Hi-res.
-- **Capture time:** ~20–60s for a long story. `gunicorn --timeout 300` covers it.
+- **Slow maps / blank tiles:** raise the per-strip wait `page.wait_for_timeout(850)`
+  in `app.py` to give map tiles and embeds longer to render before each shot.
+- **Very tall stories:** browsers cap canvas height (~32k px) on the *front-end*
+  export. Leave **Hi-res off** (the default) — Hi-res doubles pixel height. If an
+  export fails, the app tells you to retry without Hi-res.
+- **Capture time:** scales with strip count (~1–2s each); a long story may take a
+  minute or two. `gunicorn --timeout 300` covers it.
 - **Concurrency:** the Dockerfile runs 1 worker (one capture at a time) to stay
   within Starter RAM. On a bigger instance, raise `--workers`.
 - **Blank `View live` panel:** some storymaps block embedding; use *Open in new
