@@ -16,4 +16,6 @@ EXPOSE 10000
 # Shell form so ${PORT} expands. One worker keeps memory low (each capture
 # launches a Chromium ~300-500MB); raise --workers on a larger instance.
 # --timeout 300 because a long-story capture can take ~a minute.
-CMD gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 1 --timeout 300 app:app
+# 1 worker keeps memory low (one Chromium at a time). Threads let status polls
+# and the result download be served while the capture runs on a background thread.
+CMD gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 4 --timeout 300 app:app

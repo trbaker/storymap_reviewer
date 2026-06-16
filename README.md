@@ -56,15 +56,20 @@ each section's lazy images and maps load, screenshots each step, and stitches
 the strips into one tall PNG with Pillow. Normal pages that scroll the document
 still take the simple one-shot `full_page` path automatically.
 
-## Diagnostics
+## In-app status log
 
-Each successful capture sets response headers and logs to stderr (visible in
-Render's **Logs** tab):
+Capture runs as a **job** so progress is visible without leaving the page:
 
-- `X-Capture-Mode`: `strips` (nested scroll, stitched) or `fullpage`.
-- `X-Capture-Strips`: how many strips were stitched.
-- Log lines like `[capture] scroller: {...}` and `[capture] done: {...}` show the
-  detected container geometry and final height — handy if a capture looks wrong.
+- `POST /api/capture` → starts the capture on a background thread, returns
+  `{job_id, item_id}` (or `429` if a capture is already running).
+- `GET /api/capture/status/<job_id>` → `{status, log[], meta, error}`. The page
+  polls this ~once a second and streams each new log line into the on-screen
+  **Capture & export log** window (toggle with the **Log** button in the header).
+- `GET /api/capture/result/<job_id>` → the finished PNG (then the job is freed).
+
+The same log window also records the client-side export (PNG/JPG generation,
+file size, the saved filename). Every server log line is still printed to stderr
+too, so it also shows in Render's **Logs** tab.
 
 ## Notes & knobs
 
